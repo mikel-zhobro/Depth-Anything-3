@@ -17,8 +17,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from addict import Dict
-from omegaconf import DictConfig, OmegaConf
-
 from depth_anything_3.cfg import create_object
 from depth_anything_3.model.utils.transform import pose_encoding_to_extri_intri
 from depth_anything_3.utils.alignment import (
@@ -31,6 +29,7 @@ from depth_anything_3.utils.alignment import (
 )
 from depth_anything_3.utils.geometry import affine_inverse, as_homogeneous, map_pdf_to_opacity
 from depth_anything_3.utils.ray_utils import get_extrinsic_from_camray
+from omegaconf import DictConfig, OmegaConf
 
 
 def _wrap_cfg(cfg_obj):
@@ -106,14 +105,15 @@ class DepthAnything3Net(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        upsample_to_image_res: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the network.
 
         Args:
             x: Input images (B, N, 3, H, W)
-            extrinsics: Camera extrinsics (B, N, 4, 4) 
-            intrinsics: Camera intrinsics (B, N, 3, 3) 
+            extrinsics: Camera extrinsics (B, N, 4, 4)
+            intrinsics: Camera intrinsics (B, N, 3, 3)
             feat_layers: List of layer indices to extract features from
             infer_gs: Enable Gaussian Splatting branch
             use_ray_pose: Use ray-based pose estimation
@@ -130,25 +130,38 @@ class DepthAnything3Net(nn.Module):
             cam_token = None
 
         feats, aux_feats = self.backbone(
-            x, cam_token=cam_token, export_feat_layers=export_feat_layers, ref_view_strategy=ref_view_strategy
+            x,
+            cam_token=cam_token,
+            export_feat_layers=export_feat_layers,
+            ref_view_strategy=ref_view_strategy,
         )
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
 
         # Process features through depth head
         with torch.autocast(device_type=x.device.type, enabled=False):
-            output = self._process_depth_head(feats, H, W)
+            output = self._process_depth_head(feats, H, W, upsample_to_image_res=upsample_to_image_res)
             if use_ray_pose:
                 output = self._process_ray_pose_estimation(output, H, W)
             else:
                 output = self._process_camera_estimation(feats, H, W, output)
+            if not upsample_to_image_res and "intrinsics" in output:
+                # correct intrinsics if depth is not upsampled to image resff
+                h_new, w_new = output.depth.shape[-2:]
+                output.intrinsics = resize_intrinsics(
+                    output.intrinsics,
+                    original_size=(H, W),
+                    new_size=(h_new, w_new),)
+
             if infer_gs:
-                output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
-        
-        output = self._process_mono_sky_estimation(output)    
+                output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics, upsample_to_image_res=upsample_to_image_res)
+
+        output = self._process_mono_sky_estimation(output)
 
         # Extract auxiliary features if requested
-        output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
+        output.aux = aux_feats
+        output.feats = feats
+        # output.aux = self._extract_auxiliary_features(aux_feats, export_feat_layers, H, W)
 
         return output
 
@@ -163,7 +176,7 @@ class DepthAnything3Net(nn.Module):
             return output
         if (~non_sky_mask).sum() <= 10:
             return output
-        
+
         non_sky_depth = output.depth[non_sky_mask]
         if non_sky_depth.numel() > 100000:
             idx = torch.randint(0, non_sky_depth.numel(), (100000,), device=non_sky_depth.device)
@@ -189,9 +202,14 @@ class DepthAnything3Net(nn.Module):
                 output.ray.shape[-3],
                 output.ray.shape[-2],
             )
-            pred_extrinsic = affine_inverse(pred_extrinsic) # w2c -> c2w
+            pred_extrinsic = affine_inverse(pred_extrinsic)  # w2c -> c2w
             pred_extrinsic = pred_extrinsic[:, :, :3, :]
-            pred_intrinsic = torch.eye(3, 3)[None, None].repeat(pred_extrinsic.shape[0], pred_extrinsic.shape[1], 1, 1).clone().to(pred_extrinsic.device)
+            pred_intrinsic = (
+                torch.eye(3, 3)[None, None]
+                .repeat(pred_extrinsic.shape[0], pred_extrinsic.shape[1], 1, 1)
+                .clone()
+                .to(pred_extrinsic.device)
+            )
             pred_intrinsic[:, :, 0, 0] = pred_focal_lengths[:, :, 0] / 2 * width
             pred_intrinsic[:, :, 1, 1] = pred_focal_lengths[:, :, 1] / 2 * height
             pred_intrinsic[:, :, 0, 2] = pred_principal_points[:, :, 0] * width * 0.5
@@ -203,10 +221,10 @@ class DepthAnything3Net(nn.Module):
         return output
 
     def _process_depth_head(
-        self, feats: list[torch.Tensor], H: int, W: int
+        self, feats: list[torch.Tensor], H: int, W: int, upsample_to_image_res: bool = False
     ) -> Dict[str, torch.Tensor]:
         """Process features through the depth prediction head."""
-        return self.head(feats, H, W, patch_start_idx=0)
+        return self.head(feats, H, W, patch_start_idx=0, upsample_to_image_res=upsample_to_image_res)
 
     def _process_camera_estimation(
         self, feats: list[torch.Tensor], H: int, W: int, output: Dict[str, torch.Tensor]
@@ -236,6 +254,7 @@ class DepthAnything3Net(nn.Module):
         in_images: torch.Tensor,
         extrinsics: torch.Tensor | None = None,
         intrinsics: torch.Tensor | None = None,
+        upsample_to_image_res: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Process 3DGS parameters estimation if 3DGS head is available."""
         if self.gs_head is None or self.gs_adapter is None:
@@ -264,12 +283,14 @@ class DepthAnything3Net(nn.Module):
             W=W,
             patch_start_idx=0,
             images=in_images,
+            upsample_to_image_res=upsample_to_image_res
         )
         raw_gaussians = gs_outs.raw_gs
         densities = gs_outs.raw_gs_conf
 
         # convert to 'world space' 3DGS parameters; ready to export and render
         # gt_extr could be None, and will be used to align the pose scale if available
+        (H, W) = output.depth.shape[-2:]
         gs_world = self.gs_adapter(
             extrinsics=ctx_extr,
             intrinsics=ctx_intr,
@@ -342,6 +363,7 @@ class NestedDepthAnything3Net(nn.Module):
         infer_gs: bool = False,
         use_ray_pose: bool = False,
         ref_view_strategy: str = "saddle_balanced",
+        upsample_to_image_res: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through both branches with metric scaling alignment.
@@ -360,9 +382,16 @@ class NestedDepthAnything3Net(nn.Module):
         """
         # Get predictions from both branches
         output = self.da3(
-            x, extrinsics, intrinsics, export_feat_layers=export_feat_layers, infer_gs=infer_gs, use_ray_pose=use_ray_pose, ref_view_strategy=ref_view_strategy
+            x,
+            extrinsics,
+            intrinsics,
+            export_feat_layers=export_feat_layers,
+            infer_gs=infer_gs,
+            use_ray_pose=use_ray_pose,
+            ref_view_strategy=ref_view_strategy,
+            upsample_to_image_res=upsample_to_image_res,
         )
-        metric_output = self.da3_metric(x)
+        metric_output = self.da3_metric(x, upsample_to_image_res=upsample_to_image_res)
 
         # Apply metric scaling and alignment
         output = self._apply_metric_scaling(output, metric_output)
@@ -440,3 +469,36 @@ class NestedDepthAnything3Net(nn.Module):
         )
 
         return output
+
+
+def resize_intrinsics(intrinsics: torch.Tensor, original_size: tuple, new_size: tuple) -> torch.Tensor:
+    """
+    Updates camera intrinsics matrix after resizing the image.
+
+    Args:
+        intrinsics: Tensor of shape (3, 3) or (B, 3, 3).
+        original_size: Tuple (H_old, W_old).
+        new_size: Tuple (H_new, W_new).
+
+    Returns:
+        Updated intrinsics tensor of same shape.
+    """
+    H_old, W_old = original_size
+    H_new, W_new = new_size
+
+    # Calculate scale factors
+    fx_scale = W_new / W_old
+    fy_scale = H_new / H_old
+
+    # Clone to avoid modifying original tensor in-place
+    new_intrinsics = intrinsics.clone()
+
+    # Update Focal Lengths (index 0,0 and 1,1)
+    new_intrinsics[..., 0, 0] *= fx_scale
+    new_intrinsics[..., 1, 1] *= fy_scale
+
+    # Update Principal Points (index 0,2 and 1,2)
+    new_intrinsics[..., 0, 2] *= fx_scale
+    new_intrinsics[..., 1, 2] *= fy_scale
+
+    return new_intrinsics

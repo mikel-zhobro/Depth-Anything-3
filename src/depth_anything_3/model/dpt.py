@@ -163,6 +163,7 @@ class DPT(nn.Module):
         W: int,
         patch_start_idx: int,
         chunk_size: int = 8,
+        upsample_to_image_res: bool = True,
         **kwargs,
     ) -> Dict:
         """
@@ -184,7 +185,7 @@ class DPT(nn.Module):
             extra_kwargs.update({"images": rearrange(kwargs["images"], "B S ... -> (B S) ...")})
 
         if chunk_size is None or chunk_size >= S:
-            out_dict = self._forward_impl(feats, H, W, patch_start_idx, **extra_kwargs)
+            out_dict = self._forward_impl(feats, H, W, patch_start_idx, upsample_to_image_res=upsample_to_image_res, **extra_kwargs)
             out_dict = {k: v.view(B, S, *v.shape[1:]) for k, v in out_dict.items()}
             return Dict(out_dict)
 
@@ -195,7 +196,7 @@ class DPT(nn.Module):
             if "images" in extra_kwargs:
                 kw.update({"images": extra_kwargs["images"][s0:s1]})
             out_dicts.append(
-                self._forward_impl([f[s0:s1] for f in feats], H, W, patch_start_idx, **kw)
+                self._forward_impl([f[s0:s1] for f in feats], H, W, patch_start_idx, **kw, upsample_to_image_res=upsample_to_image_res)
             )
         out_dict = {k: torch.cat([od[k] for od in out_dicts], dim=0) for k in out_dicts[0].keys()}
         out_dict = {k: v.view(B, S, *v.shape[1:]) for k, v in out_dict.items()}
@@ -210,6 +211,7 @@ class DPT(nn.Module):
         H: int,
         W: int,
         patch_start_idx: int,
+        upsample_to_image_res: bool = True,
     ) -> TyDict[str, torch.Tensor]:
         B, _, C = feats[0].shape
         ph, pw = H // self.patch_size, W // self.patch_size
@@ -228,13 +230,14 @@ class DPT(nn.Module):
 
         # 2) Fusion pyramid (main branch only)
         fused = self._fuse(resized_feats)
+        fused = self.scratch.output_conv1(fused)
 
         # 3) Upsample to target resolution, optionally add position encoding again
-        h_out = int(ph * self.patch_size / self.down_ratio)
-        w_out = int(pw * self.patch_size / self.down_ratio)
+        if upsample_to_image_res:
+            h_out = int(ph * self.patch_size / self.down_ratio)
+            w_out = int(pw * self.patch_size / self.down_ratio)
+            fused = custom_interpolate(fused, (h_out, w_out), mode="bilinear", align_corners=True)
 
-        fused = self.scratch.output_conv1(fused)
-        fused = custom_interpolate(fused, (h_out, w_out), mode="bilinear", align_corners=True)
         if self.pos_embed:
             fused = self._add_pos_embed(fused, W, H)
 

@@ -117,7 +117,7 @@ class DualDPT(nn.Module):
             nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
         )
 
-        # Auxiliary fusion chain (completely separate; no sharing, i.e., "fusion_inplace=False")
+        # Auxiliary fusion chain (completely separate; no sharing, i.e., "fusion_inplace=False") + upsample:*2
         self.scratch.refinenet1_aux = _make_fusion_block(features)
         self.scratch.refinenet2_aux = _make_fusion_block(features)
         self.scratch.refinenet3_aux = _make_fusion_block(features)
@@ -160,6 +160,7 @@ class DualDPT(nn.Module):
         W: int,
         patch_start_idx: int,
         chunk_size: int = 8,
+        upsample_to_image_res: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -181,7 +182,7 @@ class DualDPT(nn.Module):
         B, S, N, C = feats[0][0].shape
         feats = [feat[0].reshape(B * S, N, C) for feat in feats]
         if chunk_size is None or chunk_size >= S:
-            out_dict = self._forward_impl(feats, H, W, patch_start_idx)
+            out_dict = self._forward_impl(feats, H, W, patch_start_idx, upsample_to_image_res=upsample_to_image_res)
             out_dict = {k: v.reshape(B, S, *v.shape[1:]) for k, v in out_dict.items()}
             return Dict(out_dict)
         out_dicts = []
@@ -192,6 +193,7 @@ class DualDPT(nn.Module):
                 H,
                 W,
                 patch_start_idx,
+                upsample_to_image_res=upsample_to_image_res,
             )
             out_dicts.append(out_dict)
         out_dict = {
@@ -211,6 +213,7 @@ class DualDPT(nn.Module):
         H: int,
         W: int,
         patch_start_idx: int,
+        upsample_to_image_res: bool = True,
     ) -> Dict[str, torch.Tensor]:
         B, _, C = feats[0].shape
         ph, pw = H // self.patch_size, W // self.patch_size
@@ -230,12 +233,13 @@ class DualDPT(nn.Module):
         fused_main, fused_aux_pyr = self._fuse(resized_feats)
 
         # 3) Upsample to target resolution and (optional) add pos-embed again
-        h_out = int(ph * self.patch_size / self.down_ratio)
-        w_out = int(pw * self.patch_size / self.down_ratio)
+        if upsample_to_image_res:
+            h_out = int(ph * self.patch_size / self.down_ratio)
+            w_out = int(pw * self.patch_size / self.down_ratio)
 
-        fused_main = custom_interpolate(
-            fused_main, (h_out, w_out), mode="bilinear", align_corners=True
-        )
+            fused_main = custom_interpolate(
+                fused_main, (h_out, w_out), mode="bilinear", align_corners=True
+            )
         if self.pos_embed:
             fused_main = self._add_pos_embed(fused_main, W, H)
 
